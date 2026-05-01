@@ -25,7 +25,7 @@ def calculate_iop(person_box, object_box):
 
 def main():
     # 1. Load the pre-trained YOLOv8 nano model
-    model = YOLO('yolov8n.pt')
+    model = YOLO('yolov8n-oiv7.pt')
 
     # 2. Hardcode the input path and dynamically generate the output path
     input_image_path = 'data/person/person3.jpeg' 
@@ -36,7 +36,8 @@ def main():
 
     # 3. Define the COCO classes:
     # 0 = person, 56 = chair, 59 = bed, 60 = dining table
-    target_classes = [0, 56, 59, 60]
+    # target_classes = [0, 56, 59, 60]
+    target_classes = [34, 104, 153, 381]  # bed, chair, desk, person
 
     print(f"Running YOLO on {input_image_path}...")
 

@@ -1,5 +1,6 @@
 import os
 import cv2
+from collections import Counter
 from ultralytics import YOLO
 
 def calculate_iop(person_box, object_box):
@@ -25,19 +26,24 @@ def format_time(seconds):
 
 def main():
     # 1. Configuration
-    model = YOLO('yolov8n.pt')
-    target_classes = [0, 56, 59, 60]  # person, chair, bed, dining table
-    IOP_THRESHOLD = 0.7
+    model = YOLO('yolov8n-oiv7.pt')
+    # target_classes = [0, 56, 59, 60]  # person, chair, bed, dining table
+    target_classes = [34, 104, 153, 381]  # bed, chair, desk, person
+    SLEEPING_THRESHOLD = 0.7
+    WORKING_THRESHOLD = 0.1
     
-    # Path to your test video (you'll need to add a video to your data folder)
-    input_video_path = 'data/video/room_video.mp4' 
-    output_video_path = 'data/video/output_room_video.mp4'
+    input_video_path = 'data/video/room_video_2.mp4' 
+    
+    # 2. Dynamically generate the output path
+    directory = os.path.dirname(input_video_path)
+    filename = os.path.basename(input_video_path)
+    output_video_path = os.path.join(directory, f"output_{filename}")
     
     if not os.path.exists(input_video_path):
         print(f"Error: Could not find video at {input_video_path}")
         return
 
-    # 2. Setup Video Capture & Writer
+    # Setup Video Capture & Writer
     cap = cv2.VideoCapture(input_video_path)
     fps = cap.get(cv2.CAP_PROP_FPS)
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -46,11 +52,13 @@ def main():
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     out = cv2.VideoWriter(output_video_path, fourcc, fps, (width, height))
 
-    # 3. State Machine Variables
-    current_action = None
-    action_start_time = 0.0
+    # 3. Buffer Variables for 3-second smoothing
+    frames_per_window = int(fps * 3)  
+    action_buffer = []                
+    window_start_time = 0.0
 
     print(f"Processing video: {input_video_path} at {fps} FPS")
+    print(f"Evaluating actions in 3-second chunks ({frames_per_window} frames/chunk)")
     print("-" * 40)
     print("TIMELINE LOG:")
 
@@ -65,9 +73,9 @@ def main():
         frame_count += 1
         current_time_sec = frame_count / fps
 
-        # Run inference (stream=True is memory efficient for videos)
+        # Run inference 
         results = model(frame, classes=target_classes, verbose=False)
-        result = results[0] # Only one frame at a time
+        result = results[0] 
         
         persons, beds, work_objects = [], [], []
         
@@ -82,46 +90,56 @@ def main():
             elif cls_id in [56, 60]:
                 work_objects.append(coords)
 
-        # Determine Frame Action (Assuming 1 primary person for timeline simplicity)
+        # Determine instant frame action
         frame_action = "Idle/Other"
         if not persons:
             frame_action = "Person not detected"
         else:
-            # We take the first person found [0] to simplify timeline logging
             person_box = persons[0]
             max_bed_iop = max([calculate_iop(person_box, bed) for bed in beds], default=0.0)
             max_work_iop = max([calculate_iop(person_box, obj) for obj in work_objects], default=0.0)
             
-            if max_bed_iop > IOP_THRESHOLD and max_bed_iop > max_work_iop:
+            if max_bed_iop > SLEEPING_THRESHOLD and max_bed_iop > max_work_iop:
                 frame_action = "Sleeping"
-            elif max_work_iop > IOP_THRESHOLD and max_work_iop > max_bed_iop:
+            elif max_work_iop > WORKING_THRESHOLD and max_work_iop > max_bed_iop:
                 frame_action = "Working"
-            elif max_bed_iop > IOP_THRESHOLD:
+            elif max_bed_iop > SLEEPING_THRESHOLD:
                 frame_action = "Sleeping"
-            elif max_work_iop > IOP_THRESHOLD:
+            elif max_work_iop > WORKING_THRESHOLD:
                 frame_action = "Working"
 
-        # 5. State Machine: Check if the action changed
-        if frame_action != current_action:
-            # If we were tracking a previous action, log how long it lasted before switching
-            if current_action is not None:
-                start_str = format_time(action_start_time)
-                end_str = format_time(current_time_sec)
-                print(f"{start_str} - {end_str}: {current_action}")
+        # 5. Add to buffer and evaluate every 3 seconds
+        action_buffer.append(frame_action)
+        
+        if len(action_buffer) == frames_per_window:
+            # Find the most common action and log the counts
+            action_counts = Counter(action_buffer)
+            most_common_action = action_counts.most_common(1)[0][0]
             
-            # Start tracking the new action
-            current_action = frame_action
-            action_start_time = current_time_sec
+            start_str = format_time(window_start_time)
+            end_str = format_time(current_time_sec)
+            
+            # Format the dictionary of counts into a clean string
+            counts_str = ", ".join([f"{k}: {v}" for k, v in action_counts.items()])
+            
+            print(f"{start_str} - {end_str}: {most_common_action} | (Breakdown -> {counts_str})")
+            
+            # Reset buffer for the next window
+            action_buffer.clear()
+            window_start_time = current_time_sec
 
-        # Write the annotated frame to the output video
+        # Annotate output video
         annotated_frame = result.plot()
         out.write(annotated_frame)
 
-    # Log the final action when the video ends
-    if current_action is not None:
-        start_str = format_time(action_start_time)
+    # Evaluate any remaining frames at the end of the video
+    if len(action_buffer) > 0:
+        action_counts = Counter(action_buffer)
+        most_common_action = action_counts.most_common(1)[0][0]
+        start_str = format_time(window_start_time)
         end_str = format_time(frame_count / fps)
-        print(f"{start_str} - {end_str}: {current_action}")
+        counts_str = ", ".join([f"{k}: {v}" for k, v in action_counts.items()])
+        print(f"{start_str} - {end_str}: {most_common_action} | (Breakdown -> {counts_str})")
 
     print("-" * 40)
     print(f"Done. Output video saved to: {output_video_path}")
