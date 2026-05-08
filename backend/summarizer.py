@@ -1,132 +1,51 @@
 import os
-import cv2
-from collections import Counter
-from ultralytics import YOLOWorld
-
-def calculate_iop(person_box, object_box):
-    """Intersection over Person Area (IoP)"""
-    xA = max(person_box[0], object_box[0])
-    yA = max(person_box[1], object_box[1])
-    xB = min(person_box[2], object_box[2])
-    yB = min(person_box[3], object_box[3])
-
-    inter_area = max(0, xB - xA) * max(0, yB - yA)
-    person_area = (person_box[2] - person_box[0]) * (person_box[3] - person_box[1])
-    
-    if person_area == 0:
-        return 0.0
-        
-    return inter_area / person_area
-
-def format_time(seconds):
-    """Convert seconds to MM:SS format"""
-    mins = int(seconds // 60)
-    secs = int(seconds % 60)
-    return f"{mins:02d}:{secs:02d}"
+import time
+import google.generativeai as genai
 
 def generate_summary(input_video_path: str) -> str:
     """
-    Process video with YOLO-World and return the textual log string instead of printing.
-    Creates annotated output video alongside original video in the data folder.
+    Process video with Google Gemini 1.5 Flash VLM and return the textual log.
     """
-    model = YOLOWorld('yolov8s-world.pt')
-    custom_classes = ["person", "chair", "bed", "study desk"]
-    model.set_classes(custom_classes)
-    
-    SLEEPING_THRESHOLD = 0.7
-    WORKING_THRESHOLD = 0.1
-    
-    directory = os.path.dirname(input_video_path)
-    filename = os.path.basename(input_video_path)
-    output_video_path = os.path.join(directory, f"world_output_{filename}")
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key or api_key == "your_api_key_here":
+        return "Error: GEMINI_API_KEY is missing. Please add it to your .env file."
+        
+    genai.configure(api_key=api_key)
     
     if not os.path.exists(input_video_path):
         return f"Error: Could not find video at {input_video_path}"
 
-    cap = cv2.VideoCapture(input_video_path)
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    if fps == 0: fps = 30 # fallback
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    out = cv2.VideoWriter(output_video_path, fourcc, fps, (width, height))
-
-    frames_per_window = int(fps * 3)  
-    action_buffer = []                
-    window_start_time = 0.0
-
-    frame_count = 0
-    logs = []
-
-    while cap.isOpened():
-        success, frame = cap.read()
-        if not success:
-            break
-
-        frame_count += 1
-        current_time_sec = frame_count / fps
-
-        results = model(frame, verbose=False)
-        result = results[0] 
+    try:
+        # 1. Upload the file to Gemini
+        print(f"Uploading {input_video_path} to Gemini...")
+        video_file = genai.upload_file(path=input_video_path)
         
-        persons, beds, work_objects = [], [], []
+        # 2. Wait for the file to finish processing on Google's servers
+        print("Waiting for video processing on Gemini servers...")
+        while video_file.state.name == "PROCESSING":
+            time.sleep(3)
+            video_file = genai.get_file(video_file.name)
+            
+        if video_file.state.name == "FAILED":
+            return "Error: Gemini failed to process the video file."
+            
+        # 3. Generate the summary using the multimodal model
+        print("Generating semantic summary...")
+        model = genai.GenerativeModel("models/gemini-1.5-flash")
         
-        for box in result.boxes:
-            cls_id = int(box.cls[0])
-            coords = box.xyxy[0].tolist()
-            
-            if cls_id == 0:    # person
-                persons.append(coords)
-            elif cls_id == 2:  # bed
-                beds.append(coords)
-            elif cls_id in [1, 3]: # chair or desk
-                work_objects.append(coords)
-
-        frame_action = "Idle/Other"
-        if not persons:
-            frame_action = "Person not detected"
-        else:
-            person_box = persons[0]
-            max_bed_iop = max([calculate_iop(person_box, bed) for bed in beds], default=0.0)
-            max_work_iop = max([calculate_iop(person_box, obj) for obj in work_objects], default=0.0)
-            
-            if max_bed_iop > SLEEPING_THRESHOLD and max_bed_iop > max_work_iop:
-                frame_action = "Sleeping"
-            elif max_work_iop > WORKING_THRESHOLD and max_work_iop > max_bed_iop:
-                frame_action = "Working"
-            elif max_bed_iop > SLEEPING_THRESHOLD:
-                frame_action = "Sleeping"
-            elif max_work_iop > WORKING_THRESHOLD:
-                frame_action = "Working"
-
-        action_buffer.append(frame_action)
+        prompt = (
+            "You are a smart surveillance assistant. Please watch this video and provide a continuous log "
+            "of the user's activities. Format your output strictly with timestamps for each distinct action, "
+            "like this: '00:00 - 00:05: The user walked to the desk and sat down.' Keep the descriptions concise "
+            "and focus on the primary human actions taking place in the room."
+        )
         
-        if len(action_buffer) == frames_per_window:
-            action_counts = Counter(action_buffer)
-            most_common_action = action_counts.most_common(1)[0][0]
-            
-            start_str = format_time(window_start_time)
-            end_str = format_time(current_time_sec)
-            counts_str = ", ".join([f"{k}: {v}" for k, v in action_counts.items()])
-            
-            logs.append(f"{start_str} - {end_str}: {most_common_action} | (Breakdown -> {counts_str})")
-            
-            action_buffer.clear()
-            window_start_time = current_time_sec
-
-        annotated_frame = result.plot()
-        out.write(annotated_frame)
-
-    if len(action_buffer) > 0:
-        action_counts = Counter(action_buffer)
-        most_common_action = action_counts.most_common(1)[0][0]
-        start_str = format_time(window_start_time)
-        end_str = format_time(frame_count / fps)
-        counts_str = ", ".join([f"{k}: {v}" for k, v in action_counts.items()])
-        logs.append(f"{start_str} - {end_str}: {most_common_action} | (Breakdown -> {counts_str})")
-
-    cap.release()
-    out.release()
-    
-    return "\n".join(logs)
+        response = model.generate_content([video_file, prompt])
+        
+        # 4. Clean up: Delete the file from Google's servers after processing to maintain privacy
+        genai.delete_file(video_file.name)
+        
+        return response.text
+        
+    except Exception as e:
+        return f"Error during VLM processing: {str(e)}"

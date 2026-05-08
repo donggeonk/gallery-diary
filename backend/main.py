@@ -5,6 +5,9 @@ from fastapi import FastAPI, UploadFile, File, Form, Depends, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from typing import Dict
+from dotenv import load_dotenv
+
+load_dotenv()
 
 from .database import SessionLocal, DailyLog
 from .summarizer import generate_summary
