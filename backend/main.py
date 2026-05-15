@@ -6,6 +6,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from typing import Dict
 from dotenv import load_dotenv
+import cv2
+from fastapi.responses import FileResponse
 
 load_dotenv()
 
@@ -92,3 +94,25 @@ def get_all_logs(db: Session = Depends(get_db)):
     logs = db.query(DailyLog).all()
     # Return as { "2026-05-01": "00:00 - 00:03 Working...", ... }
     return {log.date: log.summary for log in logs}
+
+@app.get("/api/thumbnail/{date}")
+def get_thumbnail(date: str, db: Session = Depends(get_db)):
+    """Extracts and returns the first frame of the video for a specific date."""
+    log = db.query(DailyLog).filter(DailyLog.date == date).first()
+    if not log or not log.video_path or not os.path.exists(log.video_path):
+        return {"error": "Video not found"}
+        
+    os.makedirs("data/thumbnails", exist_ok=True)
+    thumb_path = f"data/thumbnails/{date}.jpg"
+    
+    # Generate thumbnail if it doesn't exist yet
+    if not os.path.exists(thumb_path):
+        cap = cv2.VideoCapture(log.video_path)
+        success, frame = cap.read()
+        cap.release()
+        if success:
+            cv2.imwrite(thumb_path, frame)
+        else:
+            return {"error": "Could not extract thumbnail"}
+            
+    return FileResponse(thumb_path)

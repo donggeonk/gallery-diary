@@ -221,11 +221,20 @@ function showSummary(dateStr) {
     }
 
     const data = analysisData[dateStr];
+    const leftPanel = document.querySelector('.left-panel');
+    
     if (data) {
         const formattedData = data.split('\n').join('<br>');
         summaryContent.innerHTML = `<div style="font-family: monospace; font-size: 0.95rem;">${formattedData}</div>`;
+        
+        // Dynamically fetch and set the video's first frame as the background
+        leftPanel.style.backgroundImage = `linear-gradient(rgba(0, 0, 0, 0.5), rgba(0, 0, 0, 0.5)), url("${API_URL}/thumbnail/${dateStr}")`;
+        leftPanel.style.backgroundSize = "cover";
+        leftPanel.style.backgroundPosition = "center";
     } else {
         summaryContent.innerHTML = `<p class="placeholder-text">No recorded video analysis for this date.</p>`;
+        // Reset background
+        leftPanel.style.backgroundImage = "none";
     }
 }
 
