@@ -31,13 +31,12 @@ def generate_summary(input_video_path: str) -> str:
             
         # 3. Generate the summary using the multimodal model
         print("Generating semantic summary...")
-        model = genai.GenerativeModel("models/gemini-1.5-flash")
+        model = genai.GenerativeModel("gemini-2.5-flash")
         
         prompt = (
-            "You are a smart surveillance assistant. Please watch this video and provide a continuous log "
-            "of the user's activities. Format your output strictly with timestamps for each distinct action, "
-            "like this: '00:00 - 00:05: The user walked to the desk and sat down.' Keep the descriptions concise "
-            "and focus on the primary human actions taking place in the room."
+            "You are a smart diary assistant. Please watch the uploaded video and provide a brief one-paragraph summary "
+            "of the video. Format your output strictly with a summary title and then the paragraph of the summary, like" \
+            "Title: [summary title]\nSummary: [summary paragraph]."
         )
         
         response = model.generate_content([video_file, prompt])
