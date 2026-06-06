@@ -1,6 +1,9 @@
 import os
 import uuid
 import shutil
+import subprocess
+import json
+from pathlib import Path
 from fastapi import FastAPI, UploadFile, File, Form, Depends, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
@@ -9,10 +12,11 @@ from dotenv import load_dotenv
 import cv2
 from fastapi.responses import FileResponse
 
-load_dotenv()
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+load_dotenv(PROJECT_ROOT / ".env", override=True)
 
 from .database import SessionLocal, DailyLog
-from .summarizer import generate_summary
+from .summarizer import VLMProcessingError, generate_summary
 
 app = FastAPI()
 
@@ -32,28 +36,103 @@ def get_db():
     finally:
         db.close()
 
+def extract_metadata_from_video(video_path: str):
+    """
+    Attempts to extract GPS and Date metadata using ffprobe.
+    Checks general tags as well as Apple-specific QuickTime tags and stream tags.
+    If unavailable, falls back to a simulated location and None for date.
+    """
+    lat, lon, creation_date = None, None, None
+    if not shutil.which("ffprobe"):
+        print("Metadata extraction skipped: ffprobe is not installed. Install ffmpeg to read video date/GPS tags.")
+        return lat, lon, creation_date
+
+    try:
+        cmd = [
+            "ffprobe", "-v", "quiet", "-print_format", "json",
+            "-show_format", "-show_streams", video_path
+        ]
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        data = json.loads(result.stdout)
+        
+        import re
+        
+        lat_found = False
+        date_found = False
+        
+        # 1. Check top-level format tags
+        tags = data.get("format", {}).get("tags", {})
+        
+        # Apple stores location in com.apple.quicktime.location.ISO6709
+        location_str = tags.get("location") or tags.get("location-eng") or tags.get("com.apple.quicktime.location.ISO6709")
+        if location_str:
+            # Matches formats like +37.7749-122.4194/ or +38.7167-009.1333+000.000/
+            match = re.search(r'([+-]\d+\.\d+)([+-]\d+\.\d+)', location_str)
+            if match:
+                lat = float(match.group(1))
+                lon = float(match.group(2))
+                lat_found = True
+        
+        c_time = tags.get("creation_time")
+        if c_time:
+            creation_date = c_time.split("T")[0]
+            date_found = True
+            
+        # 2. Check stream-level tags if missing
+        if not lat_found or not date_found:
+            for stream in data.get("streams", []):
+                stream_tags = stream.get("tags", {})
+                
+                if not lat_found:
+                    loc = stream_tags.get("location") or stream_tags.get("location-eng") or stream_tags.get("com.apple.quicktime.location.ISO6709")
+                    if loc:
+                        match = re.search(r'([+-]\d+\.\d+)([+-]\d+\.\d+)', loc)
+                        if match:
+                            lat = float(match.group(1))
+                            lon = float(match.group(2))
+                            lat_found = True
+                            
+                if not date_found:
+                    st_time = stream_tags.get("creation_time")
+                    if st_time:
+                        creation_date = st_time.split("T")[0]
+                        date_found = True
+                        
+    except Exception as e:
+        print(f"Metadata extraction failed: {e}")
+        
+    return lat, lon, creation_date
+
 # In-memory dictionary to track async tasks (since we don't have Celery)
 # Format: { "task_uuid": { "status": "processing"|"completed"|"error", "summary": "...", "date": "..." } }
 tasks: Dict[str, dict] = {}
 
-def process_video_task(task_id: str, video_path: str, date: str, db: Session):
+def process_video_task(task_id: str, video_path: str, date: str, lat: float, lon: float):
     """Background task to run Yolo processing and save to DB."""
     try:
         # Run Heavy ML Logic
         summary_text = generate_summary(video_path)
         
-        # Save to Database
-        existing_log = db.query(DailyLog).filter(DailyLog.date == date).first()
-        if existing_log:
-            existing_log.video_path = video_path
-            existing_log.summary = summary_text
-        else:
-            new_log = DailyLog(date=date, video_path=video_path, summary=summary_text)
-            db.add(new_log)
-        db.commit()
+        # Save to Database using a fresh session
+        db = SessionLocal()
+        try:
+            existing_log = db.query(DailyLog).filter(DailyLog.date == date).first()
+            if existing_log:
+                existing_log.video_path = video_path
+                existing_log.summary = summary_text
+                existing_log.latitude = lat
+                existing_log.longitude = lon
+            else:
+                new_log = DailyLog(date=date, video_path=video_path, summary=summary_text, latitude=lat, longitude=lon)
+                db.add(new_log)
+            db.commit()
+        finally:
+            db.close()
         
         # Update Task Status
-        tasks[task_id] = {"status": "completed", "summary": summary_text, "date": date}
+        tasks[task_id] = {"status": "completed", "summary": summary_text, "date": date, "lat": lat, "lon": lon}
+    except VLMProcessingError as e:
+        tasks[task_id] = {"status": "error", "error": str(e), "date": date}
     except Exception as e:
         tasks[task_id] = {"status": "error", "error": str(e)}
 
@@ -64,24 +143,33 @@ async def upload_video(
     file: UploadFile = File(...), 
     db: Session = Depends(get_db)
 ):
-    if not file.content_type.startswith("video/"):
+    content_type = file.content_type or ""
+    filename = file.filename or ""
+    is_video = content_type.startswith("video/") or filename.lower().endswith((".mov", ".mp4"))
+    if not is_video:
         return {"error": "File not supported. Please upload a video."}
         
-    os.makedirs("data/uploaded_videos", exist_ok=True)
-    video_path = f"data/uploaded_videos/{file.filename}"
+    import tempfile
+    upload_dir = os.path.join(tempfile.gettempdir(), "room_detection_videos")
+    os.makedirs(upload_dir, exist_ok=True)
+    video_path = os.path.join(upload_dir, filename)
     
     # Save video chunk by chunk
     with open(video_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
         
+    # Extract metadata immediately to correct the tracking date if present
+    lat, lon, creation_date = extract_metadata_from_video(video_path)
+    actual_date = creation_date if creation_date else date
+    
     # Generate unique task id
     task_id = str(uuid.uuid4())
-    tasks[task_id] = {"status": "processing", "date": date}
+    tasks[task_id] = {"status": "processing", "date": actual_date}
     
     # Run the heavy video parsing in the background
-    background_tasks.add_task(process_video_task, task_id, video_path, date, db)
+    background_tasks.add_task(process_video_task, task_id, video_path, actual_date, lat, lon)
     
-    return {"task_id": task_id, "message": "Logging Video..."}
+    return {"task_id": task_id, "message": "Logging Video...", "date": actual_date}
 
 @app.get("/api/status/{task_id}")
 def get_task_status(task_id: str):
@@ -92,8 +180,14 @@ def get_task_status(task_id: str):
 def get_all_logs(db: Session = Depends(get_db)):
     """Fetch all saved video summaries from DB."""
     logs = db.query(DailyLog).all()
-    # Return as { "2026-05-01": "00:00 - 00:03 Working...", ... }
-    return {log.date: log.summary for log in logs}
+    # Return full dictionary
+    return {
+        log.date: {
+            "summary": log.summary,
+            "lat": log.latitude,
+            "lon": log.longitude
+        } for log in logs
+    }
 
 @app.get("/api/thumbnail/{date}")
 def get_thumbnail(date: str, db: Session = Depends(get_db)):
@@ -102,16 +196,17 @@ def get_thumbnail(date: str, db: Session = Depends(get_db)):
     if not log or not log.video_path or not os.path.exists(log.video_path):
         return {"error": "Video not found"}
         
-    os.makedirs("data/thumbnails", exist_ok=True)
-    thumb_path = f"data/thumbnails/{date}.jpg"
+    thumb_dir = PROJECT_ROOT / "data" / "thumbnails"
+    thumb_dir.mkdir(parents=True, exist_ok=True)
+    thumb_path = thumb_dir / f"{date}.jpg"
     
     # Generate thumbnail if it doesn't exist yet
-    if not os.path.exists(thumb_path):
+    if not thumb_path.exists():
         cap = cv2.VideoCapture(log.video_path)
         success, frame = cap.read()
         cap.release()
         if success:
-            cv2.imwrite(thumb_path, frame)
+            cv2.imwrite(str(thumb_path), frame)
         else:
             return {"error": "Could not extract thumbnail"}
             

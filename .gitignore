@@ -1,5 +1,5 @@
 /venv
-yolov8n.pt
-/data/video
-/data/uploaded_videos
+/YOLO/weights
+/data
 .env
+/data/surveillance.db
