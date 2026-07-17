@@ -24,7 +24,8 @@ let currentDate = new Date();
 let currentMonth = currentDate.getMonth();
 let currentYear = currentDate.getFullYear();
 let selectedDateStr = null;
-let analysisData = {}; // Will hold real DB data {date: {summary, lat, lon}}
+let selectedLogId = null;
+let analysisData = {}; // Real DB data grouped as {date: [logs]}
 let isProcessing = false;
 let currentPollInterval = null;
 
@@ -58,10 +59,10 @@ async function fetchLogs() {
     try {
         const response = await fetch(`${API_URL}/logs`);
         if (response.ok) {
-            analysisData = await response.json();
+            analysisData = normalizeLogData(await response.json());
             renderCalendar(currentMonth, currentYear);
             plotMapMarkers();
-            if (selectedDateStr) showSummary(selectedDateStr);
+            if (selectedDateStr) showSummary(selectedDateStr, selectedLogId);
         }
     } catch (error) {
         console.error("Error fetching logs:", error);
@@ -161,11 +162,16 @@ videoUploadInput.addEventListener('change', async (e) => {
                     isProcessing = false;
                     
                     // Save dynamically into tracking variable
-                    analysisData[dateToSave] = {
+                    const completedLog = {
+                        id: statusData.log_id || `pending-${Date.now()}`,
+                        date: dateToSave,
+                        title: statusData.title || extractLogTitle(statusData.summary),
                         summary: statusData.summary,
                         lat: statusData.lat, 
                         lon: statusData.lon
                     };
+                    analysisData[dateToSave] = getLogsForDate(dateToSave);
+                    analysisData[dateToSave].unshift(completedLog);
                     
                     // Show final visual message
                     summaryContent.innerHTML = `<h3>Logging completed!</h3>`;
@@ -198,6 +204,98 @@ function getLocalDateString(date) {
     return `${year}-${month}-${day}`;
 }
 
+function normalizeLogData(rawData) {
+    const normalized = {};
+    for (const [dateStr, value] of Object.entries(rawData || {})) {
+        normalized[dateStr] = Array.isArray(value) ? value : [value];
+    }
+    return normalized;
+}
+
+function getLogsForDate(dateStr) {
+    const logs = analysisData[dateStr];
+    if (!logs) return [];
+    return Array.isArray(logs) ? logs : [logs];
+}
+
+function getLogId(log, index, dateStr) {
+    if (log && typeof log === 'object' && log.id !== undefined && log.id !== null) {
+        return String(log.id);
+    }
+    return `${dateStr}-${index}`;
+}
+
+function getSummaryText(log) {
+    if (typeof log === 'string') return log;
+    return (log && log.summary) ? log.summary : '';
+}
+
+function extractLogTitle(summaryText) {
+    const titleLine = (summaryText || '').split('\n').find(line => line.trim().toLowerCase().startsWith('title:'));
+    if (titleLine) {
+        const title = titleLine.split(':').slice(1).join(':').trim();
+        if (title) return title;
+    }
+
+    const fallback = (summaryText || '').replace(/\s+/g, ' ').trim();
+    return fallback ? `${fallback.slice(0, 60)}${fallback.length > 60 ? '...' : ''}` : 'Untitled log';
+}
+
+function getLogTitle(log) {
+    if (log && typeof log === 'object' && log.title) return log.title;
+    return extractLogTitle(getSummaryText(log));
+}
+
+function findLogById(dateStr, logId) {
+    return getLogsForDate(dateStr).find((log, index) => getLogId(log, index, dateStr) === String(logId));
+}
+
+function getFirstLocatedLog(dateStr) {
+    return getLogsForDate(dateStr).find(log => log && log.lat !== null && log.lat !== undefined && log.lon !== null && log.lon !== undefined);
+}
+
+function escapeHTML(value) {
+    return String(value || '')
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;')
+        .replaceAll("'", '&#039;');
+}
+
+function getThumbnailUrl(dateStr, log, index) {
+    const id = getLogId(log, index, dateStr);
+    return id.startsWith(`${dateStr}-`) || id.startsWith('pending-')
+        ? `${API_URL}/thumbnail/${dateStr}`
+        : `${API_URL}/thumbnail/log/${id}`;
+}
+
+async function deleteLog(dateStr, logId) {
+    const response = await fetch(`${API_URL}/logs/${logId}`, {
+        method: 'DELETE',
+    });
+
+    const result = await response.json();
+    if (!response.ok || result.error) {
+        throw new Error(result.error || 'Failed to delete log');
+    }
+
+    const remainingLogs = getLogsForDate(dateStr).filter((log, index) => getLogId(log, index, dateStr) !== String(logId));
+    if (remainingLogs.length > 0) {
+        analysisData[dateStr] = remainingLogs;
+    } else {
+        delete analysisData[dateStr];
+    }
+
+    if (selectedLogId && String(selectedLogId) === String(logId)) {
+        selectedLogId = null;
+    }
+
+    renderCalendar(currentMonth, currentYear);
+    plotMapMarkers();
+    showSummary(dateStr);
+}
+
 const monthNames = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
 
 function renderCalendar(month, year) {
@@ -225,6 +323,7 @@ function renderCalendar(month, year) {
         dayCell.textContent = i;
         
         const dateStr = getLocalDateString(new Date(year, month, i));
+        const logsForDate = getLogsForDate(dateStr);
 
         if (isCurrentMonth && i === currentDay) {
             dayCell.classList.add('today');
@@ -234,21 +333,23 @@ function renderCalendar(month, year) {
             dayCell.classList.add('selected');
         }
 
-        if (analysisData[dateStr]) {
+        if (logsForDate.length > 0) {
             dayCell.classList.add('has-data');
         }
 
         dayCell.addEventListener('click', () => {
             selectedDateStr = dateStr;
+            selectedLogId = null;
             // Update UI
             renderCalendar(month, year); 
-            // Also show summary
+            // Also show the day's log menu
             if (!isProcessing) {
                 showSummary(dateStr);
                 
                 // If map is open, center on it
-                if (mapView.style.display === 'flex' && analysisData[dateStr] && analysisData[dateStr].lat) {
-                    map.setView([analysisData[dateStr].lat, analysisData[dateStr].lon], 15);
+                const locatedLog = getFirstLocatedLog(dateStr);
+                if (mapView.style.display === 'flex' && locatedLog) {
+                    map.setView([locatedLog.lat, locatedLog.lon], 15);
                 }
             }
         });
@@ -284,11 +385,18 @@ function plotMapMarkers(highlightParams = null) {
     
     let allCoordinates = [];
     
-    for (const [dateStr, data] of Object.entries(analysisData)) {
-        if(data && data.lat !== null && data.lon !== null) {
+    for (const [dateStr, logs] of Object.entries(analysisData)) {
+        getLogsForDate(dateStr).forEach((data, index) => {
+            if(!data || data.lat === null || data.lat === undefined || data.lon === null || data.lon === undefined) {
+                return;
+            }
+
+            const logId = getLogId(data, index, dateStr);
             // Apply search filtering visibly to markers 
             let opacity = 1.0;
-            if (highlightParams && highlightParams.dates && !highlightParams.dates.includes(dateStr)) {
+            if (highlightParams && highlightParams.logIds && !highlightParams.logIds.includes(logId)) {
+                opacity = 0.3; // fade out non-matching
+            } else if (highlightParams && highlightParams.dates && !highlightParams.dates.includes(dateStr)) {
                 opacity = 0.3; // fade out non-matching 
             }
             
@@ -300,20 +408,21 @@ function plotMapMarkers(highlightParams = null) {
                 opacity: opacity
             }).addTo(map);
             
-            marker.bindTooltip(dateStr);
+            marker.bindTooltip(`${dateStr} - ${getLogTitle(data)}`);
             
             marker.on('click', () => {
                 selectedDateStr = dateStr;
+                selectedLogId = logId;
                 const dateObj = new Date(dateStr + "T00:00:00");
                 currentMonth = dateObj.getMonth();
                 currentYear = dateObj.getFullYear();
                 renderCalendar(currentMonth, currentYear);
-                showSummary(dateStr);
+                showSummary(dateStr, logId);
             });
             
             mapMarkers.push(marker);
             allCoordinates.push([data.lat, data.lon]);
-        }
+        });
     }
     
     // fit bounds if no specific selection
@@ -323,9 +432,12 @@ function plotMapMarkers(highlightParams = null) {
 }
 
 // ---- Right Bottom: Summary Display Logic ----
-function showSummary(dateStr) {
+function showSummary(dateStr, logId = null) {
     // Basic format: "Invalid Date" check just in case
     if (!dateStr) return;
+
+    selectedDateStr = dateStr;
+    selectedLogId = logId ? String(logId) : null;
     
     const d = new Date(dateStr + "T00:00:00");
     selectedDateDisplay.textContent = d.toLocaleDateString(undefined, { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
@@ -335,30 +447,126 @@ function showSummary(dateStr) {
         return; 
     }
 
-    const data = analysisData[dateStr];
-    const leftPanel = document.querySelector('.left-panel');
+    const logs = getLogsForDate(dateStr);
     
-    if (data) {
-        // Now data holds {summary, lat, lon} or string if we are handling backwards compatibility, but backend sends object
-        const summaryText = typeof data === 'string' ? data : data.summary;
-        const formattedData = summaryText.split('\n').join('<br>');
-        summaryContent.innerHTML = `<div style="font-family: monospace; font-size: 0.95rem;">${formattedData}</div>`;
-        
-        // Dynamically fetch and set the video's first frame as the background
-        leftPanel.style.backgroundImage = `linear-gradient(rgba(0, 0, 0, 0.5), rgba(0, 0, 0, 0.5)), url("${API_URL}/thumbnail/${dateStr}")`;
-        leftPanel.style.backgroundSize = "cover";
-        leftPanel.style.backgroundPosition = "center";
-        
-        // Center map on selected items if they exist
-        if (map && data.lat !== null && data.lon !== null) {
-             map.setView([data.lat, data.lon], 15);
-        }
-        
-    } else {
-        summaryContent.innerHTML = `<p class="placeholder-text">No recorded video analysis for this date.</p>`;
-        // Reset background
-        leftPanel.style.backgroundImage = "none";
+    if (logs.length === 0) {
+        renderEmptyDate();
+        return;
     }
+
+    if (selectedLogId) {
+        renderLogDetail(dateStr, selectedLogId);
+        return;
+    }
+
+    renderLogMenu(dateStr, logs);
+}
+
+function renderEmptyDate() {
+    summaryContent.innerHTML = `<p class="placeholder-text">No recorded video analysis for this date.</p>`;
+    document.querySelector('.left-panel').style.backgroundImage = "none";
+}
+
+function renderLogMenu(dateStr, logs) {
+    selectedDateDisplay.textContent += ` - ${logs.length} ${logs.length === 1 ? 'log' : 'logs'}`;
+    summaryContent.innerHTML = '';
+
+    const menu = document.createElement('div');
+    menu.classList.add('log-menu');
+
+    logs.forEach((log, index) => {
+        const logId = getLogId(log, index, dateStr);
+
+        const item = document.createElement('div');
+        item.classList.add('log-menu-item');
+        item.setAttribute('role', 'button');
+        item.setAttribute('tabindex', '0');
+
+        const title = document.createElement('span');
+        title.classList.add('log-menu-title');
+        title.textContent = getLogTitle(log);
+
+        const deleteButton = document.createElement('button');
+        deleteButton.type = 'button';
+        deleteButton.classList.add('log-delete-btn');
+        deleteButton.setAttribute('aria-label', `Delete ${getLogTitle(log)}`);
+        deleteButton.textContent = '×';
+
+        deleteButton.addEventListener('click', async (event) => {
+            event.stopPropagation();
+            if (!confirm('Delete this log?')) return;
+
+            try {
+                await deleteLog(dateStr, logId);
+            } catch (error) {
+                alert(error.message);
+            }
+        });
+
+        item.appendChild(title);
+        item.appendChild(deleteButton);
+
+        item.addEventListener('click', () => {
+            showSummary(dateStr, logId);
+        });
+
+        item.addEventListener('keydown', (event) => {
+            if (event.key === 'Enter' || event.key === ' ') {
+                event.preventDefault();
+                showSummary(dateStr, logId);
+            }
+        });
+
+        menu.appendChild(item);
+    });
+
+    summaryContent.appendChild(menu);
+    setLeftPanelPreview(dateStr, logs[0], 0);
+
+    const locatedLog = getFirstLocatedLog(dateStr);
+    if (map && locatedLog) {
+        map.setView([locatedLog.lat, locatedLog.lon], 15);
+    }
+}
+
+function renderLogDetail(dateStr, logId) {
+    const logs = getLogsForDate(dateStr);
+    const logIndex = logs.findIndex((log, index) => getLogId(log, index, dateStr) === String(logId));
+    const log = logIndex >= 0 ? logs[logIndex] : null;
+    if (!log) {
+        selectedLogId = null;
+        renderLogMenu(dateStr, logs);
+        return;
+    }
+
+    const titleText = getLogTitle(log);
+    const summaryText = getSummaryText(log);
+    selectedDateDisplay.textContent = `${selectedDateDisplay.textContent} - ${titleText}`;
+    summaryContent.innerHTML = `
+        <div class="summary-detail-header">
+            <button type="button" class="back-btn" aria-label="Back to log list">&larr;</button>
+            <h4>${escapeHTML(titleText)}</h4>
+        </div>
+        <div class="summary-text">${escapeHTML(summaryText).split('\n').join('<br>')}</div>
+    `;
+
+    summaryContent.querySelector('.back-btn').addEventListener('click', () => {
+        selectedLogId = null;
+        showSummary(dateStr);
+    });
+
+    setLeftPanelPreview(dateStr, log, logIndex);
+
+    if (map && log.lat !== null && log.lat !== undefined && log.lon !== null && log.lon !== undefined) {
+        map.setView([log.lat, log.lon], 15);
+    }
+}
+
+function setLeftPanelPreview(dateStr, log, index) {
+    const leftPanel = document.querySelector('.left-panel');
+    leftPanel.style.backgroundImage = `linear-gradient(rgba(0, 0, 0, 0.5), rgba(0, 0, 0, 0.5)), url("${getThumbnailUrl(dateStr, log, index)}")`;
+    leftPanel.style.backgroundSize = "cover";
+    leftPanel.style.backgroundPosition = "center";
 }
 
 // ---- Search Logic ----

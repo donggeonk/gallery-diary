@@ -107,6 +107,18 @@ def extract_metadata_from_video(video_path: str):
 # Format: { "task_uuid": { "status": "processing"|"completed"|"error", "summary": "...", "date": "..." } }
 tasks: Dict[str, dict] = {}
 
+def extract_summary_title(summary_text: str) -> str:
+    """Use the VLM's Title line as the gallery menu label."""
+    for line in (summary_text or "").splitlines():
+        clean_line = line.strip()
+        if clean_line.lower().startswith("title:"):
+            title = clean_line.split(":", 1)[1].strip()
+            if title:
+                return title
+
+    fallback = " ".join((summary_text or "").split())
+    return fallback[:60] + ("..." if len(fallback) > 60 else "") if fallback else "Untitled log"
+
 def process_video_task(task_id: str, video_path: str, date: str, lat: float, lon: float):
     """Background task to run Yolo processing and save to DB."""
     try:
@@ -116,21 +128,24 @@ def process_video_task(task_id: str, video_path: str, date: str, lat: float, lon
         # Save to Database using a fresh session
         db = SessionLocal()
         try:
-            existing_log = db.query(DailyLog).filter(DailyLog.date == date).first()
-            if existing_log:
-                existing_log.video_path = video_path
-                existing_log.summary = summary_text
-                existing_log.latitude = lat
-                existing_log.longitude = lon
-            else:
-                new_log = DailyLog(date=date, video_path=video_path, summary=summary_text, latitude=lat, longitude=lon)
-                db.add(new_log)
+            new_log = DailyLog(date=date, video_path=video_path, summary=summary_text, latitude=lat, longitude=lon)
+            db.add(new_log)
             db.commit()
+            db.refresh(new_log)
+            log_id = new_log.id
         finally:
             db.close()
         
         # Update Task Status
-        tasks[task_id] = {"status": "completed", "summary": summary_text, "date": date, "lat": lat, "lon": lon}
+        tasks[task_id] = {
+            "status": "completed",
+            "log_id": log_id,
+            "title": extract_summary_title(summary_text),
+            "summary": summary_text,
+            "date": date,
+            "lat": lat,
+            "lon": lon
+        }
     except VLMProcessingError as e:
         tasks[task_id] = {"status": "error", "error": str(e), "date": date}
     except Exception as e:
@@ -179,27 +194,38 @@ def get_task_status(task_id: str):
 @app.get("/api/logs")
 def get_all_logs(db: Session = Depends(get_db)):
     """Fetch all saved video summaries from DB."""
-    logs = db.query(DailyLog).all()
-    # Return full dictionary
-    return {
-        log.date: {
+    logs = db.query(DailyLog).order_by(DailyLog.date.desc(), DailyLog.id.desc()).all()
+    grouped_logs = {}
+    for log in logs:
+        grouped_logs.setdefault(log.date, []).append({
+            "id": log.id,
+            "date": log.date,
+            "title": extract_summary_title(log.summary),
             "summary": log.summary,
             "lat": log.latitude,
             "lon": log.longitude
-        } for log in logs
-    }
+        })
+    return grouped_logs
 
-@app.get("/api/thumbnail/{date}")
-def get_thumbnail(date: str, db: Session = Depends(get_db)):
-    """Extracts and returns the first frame of the video for a specific date."""
-    log = db.query(DailyLog).filter(DailyLog.date == date).first()
+@app.delete("/api/logs/{log_id}")
+def delete_log(log_id: int, db: Session = Depends(get_db)):
+    """Delete a single log from the database."""
+    log = db.query(DailyLog).filter(DailyLog.id == log_id).first()
+    if not log:
+        return {"error": "Log not found"}
+
+    db.delete(log)
+    db.commit()
+    return {"status": "deleted", "log_id": log_id}
+
+def thumbnail_response_for_log(log: DailyLog, thumb_name: str):
     if not log or not log.video_path or not os.path.exists(log.video_path):
         return {"error": "Video not found"}
-        
+
     thumb_dir = PROJECT_ROOT / "data" / "thumbnails"
     thumb_dir.mkdir(parents=True, exist_ok=True)
-    thumb_path = thumb_dir / f"{date}.jpg"
-    
+    thumb_path = thumb_dir / thumb_name
+
     # Generate thumbnail if it doesn't exist yet
     if not thumb_path.exists():
         cap = cv2.VideoCapture(log.video_path)
@@ -209,5 +235,17 @@ def get_thumbnail(date: str, db: Session = Depends(get_db)):
             cv2.imwrite(str(thumb_path), frame)
         else:
             return {"error": "Could not extract thumbnail"}
-            
+
     return FileResponse(thumb_path)
+
+@app.get("/api/thumbnail/log/{log_id}")
+def get_log_thumbnail(log_id: int, db: Session = Depends(get_db)):
+    """Extracts and returns the first frame for a specific log."""
+    log = db.query(DailyLog).filter(DailyLog.id == log_id).first()
+    return thumbnail_response_for_log(log, f"log-{log_id}.jpg")
+
+@app.get("/api/thumbnail/{date}")
+def get_thumbnail(date: str, db: Session = Depends(get_db)):
+    """Extracts and returns the newest first frame for a specific date."""
+    log = db.query(DailyLog).filter(DailyLog.date == date).order_by(DailyLog.id.desc()).first()
+    return thumbnail_response_for_log(log, f"{date}.jpg")
